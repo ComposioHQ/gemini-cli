@@ -45,6 +45,7 @@ import { LoopDetectionService } from '../services/loopDetectionService.js';
 import { ideContext } from '../ide/ideContext.js';
 import { logFlashDecidedToContinue } from '../telemetry/loggers.js';
 import { FlashDecidedToContinueEvent } from '../telemetry/types.js';
+import { testBenchAnalytics } from '../services/testBenchAnalytics.js';
 
 function isThinkingSupported(model: string) {
   if (model.startsWith('gemini-2.5')) return true;
@@ -582,9 +583,20 @@ export class GeminiClient {
   }
 
   async generateEmbedding(texts: string[]): Promise<number[][]> {
+    const startTime = performance.now();
+    
     if (!texts || texts.length === 0) {
       return [];
     }
+
+    if (testBenchAnalytics.isAnalyticsEnabled()) {
+      console.log(`🧠 Generating embeddings for ${texts.length} text(s) using model: ${this.embeddingModel}`);
+      texts.forEach((text, i) => {
+        const preview = text.length > 100 ? text.substring(0, 100) + '...' : text;
+        console.log(`  ${i + 1}. "${preview}"`);
+      });
+    }
+
     const embedModelParams: EmbedContentParameters = {
       model: this.embeddingModel,
       contents: texts,
@@ -605,7 +617,7 @@ export class GeminiClient {
       );
     }
 
-    return embedContentResponse.embeddings.map((embedding, index) => {
+    const embeddings = embedContentResponse.embeddings.map((embedding, index) => {
       const values = embedding.values;
       if (!values || values.length === 0) {
         throw new Error(
@@ -614,6 +626,63 @@ export class GeminiClient {
       }
       return values;
     });
+
+    // Log embedding analytics if enabled
+    if (testBenchAnalytics.isAnalyticsEnabled()) {
+      const embeddingTime = performance.now() - startTime;
+      console.log(`🧠 Embedding generation completed in ${embeddingTime.toFixed(2)}ms`);
+      
+      // Calculate embedding statistics
+      embeddings.forEach((embedding, i) => {
+        const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
+        const nonZeroCount = embedding.filter(val => val !== 0).length;
+        console.log(`  Embedding ${i + 1}: ${embedding.length} dimensions, magnitude: ${magnitude.toFixed(4)}, non-zero: ${nonZeroCount}`);
+      });
+
+      // If this is part of a search context, we can analyze similarity
+      this.analyzeEmbeddingSimilarities(embeddings, texts);
+    }
+
+    return embeddings;
+  }
+
+  /**
+   * Analyze similarities between generated embeddings
+   */
+  private analyzeEmbeddingSimilarities(embeddings: number[][], texts: string[]) {
+    if (embeddings.length < 2) return;
+
+    console.log(`📊 EMBEDDING SIMILARITY ANALYSIS:`);
+    
+    for (let i = 0; i < embeddings.length; i++) {
+      for (let j = i + 1; j < embeddings.length; j++) {
+        const similarity = this.calculateCosineSimilarity(embeddings[i], embeddings[j]);
+        const text1Preview = texts[i].length > 50 ? texts[i].substring(0, 50) + '...' : texts[i];
+        const text2Preview = texts[j].length > 50 ? texts[j].substring(0, 50) + '...' : texts[j];
+        
+        console.log(`  "${text1Preview}" ↔ "${text2Preview}": ${(similarity * 100).toFixed(1)}% similar`);
+      }
+    }
+  }
+
+  /**
+   * Calculate cosine similarity between two vectors
+   */
+  private calculateCosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length) return 0;
+    
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    
+    const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+    return denominator === 0 ? 0 : dotProduct / denominator;
   }
 
   async tryCompressChat(

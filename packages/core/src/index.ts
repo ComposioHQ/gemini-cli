@@ -44,6 +44,8 @@ export * from './utils/formatters.js';
 // Export services
 export * from './services/fileDiscoveryService.js';
 export * from './services/gitService.js';
+export * from './services/testBenchAnalytics.js';
+export * from './services/urlContentDownloader.js';
 
 // Export IDE specific logic
 export * from './ide/ide-client.js';

@@ -22,6 +22,7 @@ import {
   recordFileOperationMetric,
   FileOperation,
 } from '../telemetry/metrics.js';
+import { testBenchAnalytics } from '../services/testBenchAnalytics.js';
 
 /**
  * Parameters for the ReadManyFilesTool.
@@ -263,6 +264,32 @@ Use this tool when the user's query implies needing the content of several files
       };
     }
 
+    // Start analytics session if test-bench is enabled
+    let analyticsSession = null;
+    if (testBenchAnalytics.isAnalyticsEnabled()) {
+      const searchQuery = `ReadManyFiles: ${params.paths.join(', ')}`;
+      analyticsSession = testBenchAnalytics.startSearch(
+        searchQuery,
+        'read_files',
+        this.config.getTargetDir()
+      );
+      
+      // Add tool decision reasoning and parameters
+      analyticsSession.setToolDecisionReason('CLI chose ReadManyFiles tool for multi-file pattern matching');
+      analyticsSession.setSearchParameters({
+        paths: params.paths,
+        include: params.include,
+        exclude: params.exclude,
+        recursive: params.recursive,
+        useDefaultExcludes: params.useDefaultExcludes,
+        file_filtering_options: params.file_filtering_options,
+        target_directory: this.config.getTargetDir()
+      });
+      
+      console.log(`🔍 TestBench: Tracking ReadManyFiles operation for patterns: ${params.paths.join(', ')}`);
+      console.log(`🎯 TestBench: Tool selected for multi-file search with patterns: ${params.paths.join(', ')}`);
+    }
+
     const {
       paths: inputPatterns,
       include = [],
@@ -405,6 +432,12 @@ Use this tool when the user's query implies needing the content of several files
         });
       }
     } catch (error) {
+      // Complete analytics session on error
+      if (analyticsSession && testBenchAnalytics.isAnalyticsEnabled()) {
+        analyticsSession.complete();
+        console.log(`❌ TestBench: ReadManyFiles failed during file search: ${getErrorMessage(error)}`);
+      }
+      
       return {
         llmContent: `Error during file search: ${getErrorMessage(error)}`,
         returnDisplay: `## File Search Error\n\nAn error occurred while searching for files:\n\`\`\`\n${getErrorMessage(error)}\n\`\`\``,
@@ -522,6 +555,44 @@ Use this tool when the user's query implies needing the content of several files
         'No files matching the criteria were found or all were skipped.',
       );
     }
+
+    // Complete analytics session if active
+    if (analyticsSession && testBenchAnalytics.isAnalyticsEnabled()) {
+      // Add match details for each file read
+      processedFilesRelativePaths.forEach((filePath) => {
+        const fullPath = path.resolve(this.config.getTargetDir(), filePath);
+        let fileSize = 0;
+        let fileLastModified = Date.now();
+        
+        try {
+          const stats = require('fs').statSync(fullPath);
+          fileSize = stats.size;
+          fileLastModified = stats.mtime.getTime();
+        } catch (error) {
+          // Use defaults if stat fails
+        }
+        
+        analyticsSession.addMatch({
+          filePath,
+          lineNumber: 0,
+          matchText: `File: ${filePath}`,
+          matchReason: 'File read successfully',
+          relevanceScore: 1.0,
+          fileSize,
+          fileLastModified
+        });
+      });
+
+      analyticsSession.setFilesScanned(sortedFiles.length);
+      analyticsSession.complete();
+      
+      console.log(`📊 TestBench: ReadManyFiles completed - ${processedFilesRelativePaths.length} files read, ${skippedFiles.length} files skipped`);
+      
+      if (processedFilesRelativePaths.length > 0) {
+        console.log(`📁 TestBench: Files read: ${processedFilesRelativePaths.slice(0, 3).join(', ')}${processedFilesRelativePaths.length > 3 ? '...' : ''}`);
+      }
+    }
+
     return {
       llmContent: contentParts,
       returnDisplay: displayMessage.trim(),

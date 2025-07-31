@@ -18,6 +18,7 @@ import {
   recordFileOperationMetric,
   FileOperation,
 } from '../telemetry/metrics.js';
+import { testBenchAnalytics } from '../services/testBenchAnalytics.js';
 
 /**
  * Parameters for the ReadFile tool
@@ -137,6 +138,30 @@ export class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
       };
     }
 
+    // Start analytics session if test-bench is enabled
+    let analyticsSession = null;
+    if (testBenchAnalytics.isAnalyticsEnabled()) {
+      const relativePath = path.relative(this.config.getTargetDir(), params.absolute_path);
+      const searchQuery = `ReadFile: ${relativePath}`;
+      analyticsSession = testBenchAnalytics.startSearch(
+        searchQuery,
+        'read_files',
+        this.config.getTargetDir()
+      );
+      
+      // Add tool decision reasoning
+      analyticsSession.setToolDecisionReason('CLI chose ReadFile tool for single file access');
+      analyticsSession.setSearchParameters({
+        absolute_path: params.absolute_path,
+        offset: params.offset,
+        limit: params.limit,
+        target_directory: this.config.getTargetDir()
+      });
+      
+      console.log(`🔍 TestBench: Tracking ReadFile operation for: ${relativePath}`);
+      console.log(`🎯 TestBench: Tool selected because CLI requested specific file: ${relativePath}`);
+    }
+
     const result = await processSingleFileContent(
       params.absolute_path,
       this.config.getTargetDir(),
@@ -145,6 +170,12 @@ export class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
     );
 
     if (result.error) {
+      // Complete analytics session on error
+      if (analyticsSession && testBenchAnalytics.isAnalyticsEnabled()) {
+        analyticsSession.complete();
+        console.log(`❌ TestBench: ReadFile failed: ${result.error}`);
+      }
+      
       return {
         llmContent: result.error, // The detailed error for LLM
         returnDisplay: result.returnDisplay || 'Error reading file', // User-friendly error
@@ -163,6 +194,37 @@ export class ReadFileTool extends BaseTool<ReadFileToolParams, ToolResult> {
       mimetype,
       path.extname(params.absolute_path),
     );
+
+    // Complete analytics session if active
+    if (analyticsSession && testBenchAnalytics.isAnalyticsEnabled()) {
+      const relativePath = path.relative(this.config.getTargetDir(), params.absolute_path);
+      let fileSize = 0;
+      let fileLastModified = Date.now();
+      
+      try {
+        const fs = require('fs');
+        const stats = fs.statSync(params.absolute_path);
+        fileSize = stats.size;
+        fileLastModified = stats.mtime.getTime();
+      } catch (error) {
+        // Use defaults if stat fails
+      }
+      
+      analyticsSession.addMatch({
+        filePath: relativePath,
+        lineNumber: params.offset || 0,
+        matchText: `File: ${relativePath}`,
+        matchReason: 'File read successfully',
+        relevanceScore: 1.0,
+        fileSize,
+        fileLastModified
+      });
+
+      analyticsSession.setFilesScanned(1);
+      analyticsSession.complete();
+      
+      console.log(`📊 TestBench: ReadFile completed - ${relativePath} (${fileSize} bytes, ${lines || 'N/A'} lines)`);
+    }
 
     return {
       llmContent: result.llmContent || '',

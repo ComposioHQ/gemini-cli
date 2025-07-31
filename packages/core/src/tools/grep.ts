@@ -17,6 +17,10 @@ import { makeRelative, shortenPath } from '../utils/paths.js';
 import { getErrorMessage, isNodeError } from '../utils/errors.js';
 import { isGitRepository } from '../utils/gitUtils.js';
 import { Config } from '../config/config.js';
+import {
+  testBenchAnalytics,
+  MatchAnalytics,
+} from '../services/testBenchAnalytics.js';
 
 // --- Interfaces ---
 
@@ -170,8 +174,17 @@ export class GrepTool extends BaseTool<GrepToolParams, ToolResult> {
     params: GrepToolParams,
     signal: AbortSignal,
   ): Promise<ToolResult> {
+    // Start analytics session
+    const session = testBenchAnalytics.startSearch(
+      params.pattern,
+      'grep',
+      params.path || '.',
+    );
+    session.setPattern(params.pattern);
+
     const validationError = this.validateToolParams(params);
     if (validationError) {
+      session.complete();
       return {
         llmContent: `Error: Invalid parameters provided. Reason: ${validationError}`,
         returnDisplay: `Model provided invalid parameters. Error: ${validationError}`,
@@ -196,11 +209,12 @@ export class GrepTool extends BaseTool<GrepToolParams, ToolResult> {
       // Collect matches from all search directories
       let allMatches: GrepMatch[] = [];
       for (const searchDir of searchDirectories) {
-        const matches = await this.performGrepSearch({
+        const matches = await this.performGrepSearchWithAnalytics({
           pattern: params.pattern,
           path: searchDir,
           include: params.include,
           signal,
+          session,
         });
 
         // Add directory prefix if searching multiple directories
@@ -226,6 +240,7 @@ export class GrepTool extends BaseTool<GrepToolParams, ToolResult> {
       }
 
       if (allMatches.length === 0) {
+        session.complete();
         const noMatchMsg = `No matches found for pattern "${params.pattern}" ${searchLocationDescription}${params.include ? ` (filter: "${params.include}")` : ''}.`;
         return { llmContent: noMatchMsg, returnDisplay: `No matches found` };
       }
@@ -260,11 +275,15 @@ export class GrepTool extends BaseTool<GrepToolParams, ToolResult> {
         llmContent += '---\n';
       }
 
+      // Complete analytics session
+      session.complete();
+
       return {
         llmContent: llmContent.trim(),
         returnDisplay: `Found ${matchCount} ${matchTerm}`,
       };
     } catch (error) {
+      session.complete();
       console.error(`Error during GrepLogic execution: ${error}`);
       const errorMessage = getErrorMessage(error);
       return {
@@ -589,5 +608,269 @@ export class GrepTool extends BaseTool<GrepToolParams, ToolResult> {
       );
       throw error; // Re-throw
     }
+  }
+
+  /**
+   * Enhanced version of performGrepSearch with detailed analytics tracking
+   */
+  private async performGrepSearchWithAnalytics(options: {
+    pattern: string;
+    path: string;
+    include?: string;
+    signal: AbortSignal;
+    session: import('../services/testBenchAnalytics.js').SearchSession;
+  }): Promise<GrepMatch[]> {
+    const { session } = options;
+    const _startTime = performance.now();
+    let filesScanned = 0;
+    const _strategyUsed = 'none';
+
+    try {
+      // Call the original method
+      const matches = await this.performGrepSearch(options);
+
+      // Enhanced analytics processing
+      if (session.isActive()) {
+        // Count files in directory for analytics
+        try {
+          const globPattern = options.include || '**/*';
+          const ignorePatterns = [
+            '.git/**',
+            'node_modules/**',
+            'bower_components/**',
+          ];
+          const filesStream = globStream(globPattern, {
+            cwd: options.path,
+            dot: true,
+            ignore: ignorePatterns,
+            absolute: true,
+            nodir: true,
+          });
+
+          for await (const _filePath of filesStream) {
+            filesScanned++;
+          }
+        } catch (error) {
+          console.debug('Error counting files for analytics:', error);
+        }
+
+        session.setFilesScanned(filesScanned);
+
+        // Process each match with detailed analytics
+        for (const match of matches) {
+          const matchAnalytics: MatchAnalytics =
+            await this.createMatchAnalytics(
+              match,
+              options.pattern,
+              options.path,
+            );
+          session.addMatch(matchAnalytics);
+        }
+
+        // Add ranking factors
+        this.addSearchRankingFactors(session, options, matches, filesScanned);
+      }
+
+      return matches;
+    } catch (error) {
+      console.error('Error in performGrepSearchWithAnalytics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Creates detailed analytics for a single match
+   */
+  private async createMatchAnalytics(
+    match: GrepMatch,
+    pattern: string,
+    searchPath: string,
+  ): Promise<MatchAnalytics> {
+    let fileSize = 0;
+    let fileLastModified = 0;
+    let contextBefore = '';
+    let contextAfter = '';
+
+    try {
+      const fullPath = path.resolve(searchPath, match.filePath);
+      const stats = await fsPromises.stat(fullPath);
+      fileSize = stats.size;
+      fileLastModified = stats.mtimeMs;
+
+      // Get context lines for better understanding
+      const content = await fsPromises.readFile(fullPath, 'utf8');
+      const lines = content.split('\n');
+      const lineIndex = match.lineNumber - 1;
+
+      contextBefore = lines
+        .slice(Math.max(0, lineIndex - 2), lineIndex)
+        .join('\n');
+      contextAfter = lines
+        .slice(lineIndex + 1, Math.min(lines.length, lineIndex + 3))
+        .join('\n');
+    } catch (error) {
+      console.debug(`Could not get file stats for ${match.filePath}:`, error);
+    }
+
+    // Calculate relevance score based on various factors
+    const relevanceScore = this.calculateRelevanceScore(match, pattern);
+
+    return {
+      filePath: match.filePath,
+      lineNumber: match.lineNumber,
+      matchText: match.line,
+      contextBefore,
+      contextAfter,
+      relevanceScore,
+      matchReason: this.getMatchReason(match, pattern),
+      fileSize,
+      fileLastModified,
+    };
+  }
+
+  /**
+   * Calculate relevance score for a match (0-1)
+   */
+  private calculateRelevanceScore(match: GrepMatch, pattern: string): number {
+    let score = 0.5; // Base score
+
+    // Exact match bonus
+    if (match.line.toLowerCase().includes(pattern.toLowerCase())) {
+      score += 0.2;
+    }
+
+    // Line length factor (shorter lines with matches are often more relevant)
+    const lineLength = match.line.trim().length;
+    if (lineLength < 100) score += 0.1;
+    if (lineLength < 50) score += 0.1;
+
+    // Position factor (matches at beginning of line are often more relevant)
+    const trimmedLine = match.line.trim();
+    const matchIndex = trimmedLine.toLowerCase().indexOf(pattern.toLowerCase());
+    if (matchIndex < 10) score += 0.1;
+
+    // File extension bonus
+    const ext = path.extname(match.filePath).toLowerCase();
+    if (['.md', '.txt', '.js', '.ts', '.py', '.java'].includes(ext)) {
+      score += 0.1;
+    }
+
+    return Math.min(1, score);
+  }
+
+  /**
+   * Determine why this particular match was selected
+   */
+  private getMatchReason(match: GrepMatch, pattern: string): string {
+    const reasons = [];
+
+    if (match.line.toLowerCase().includes(pattern.toLowerCase())) {
+      reasons.push('exact pattern match');
+    }
+
+    const regex = new RegExp(pattern, 'i');
+    if (regex.test(match.line)) {
+      reasons.push('regex pattern match');
+    }
+
+    const ext = path.extname(match.filePath);
+    if (ext) {
+      reasons.push(`found in ${ext} file`);
+    }
+
+    if (match.lineNumber < 10) {
+      reasons.push('near file beginning');
+    }
+
+    return reasons.join(', ') || 'pattern match';
+  }
+
+  /**
+   * Add ranking factors to help understand search effectiveness
+   */
+  private addSearchRankingFactors(
+    session: import('../services/testBenchAnalytics.js').SearchSession,
+    options: { pattern: string; path: string; include?: string },
+    matches: GrepMatch[],
+    filesScanned: number,
+  ) {
+    if (!session.isActive()) return;
+
+    // Pattern complexity factor
+    const patternComplexity = this.calculatePatternComplexity(options.pattern);
+    session.addRankingFactor({
+      factor: 'Pattern Complexity',
+      weight: 0.3,
+      value: patternComplexity,
+      impact: patternComplexity * 0.3,
+      explanation: `Pattern "${options.pattern}" has ${patternComplexity > 0.5 ? 'high' : 'low'} complexity (${patternComplexity.toFixed(2)})`,
+    });
+
+    // Search scope factor
+    const scopeFactor = filesScanned > 100 ? 1.0 : filesScanned / 100;
+    session.addRankingFactor({
+      factor: 'Search Scope',
+      weight: 0.2,
+      value: scopeFactor,
+      impact: scopeFactor * 0.2,
+      explanation: `Searched ${filesScanned} files (scope factor: ${scopeFactor.toFixed(2)})`,
+    });
+
+    // Result density factor
+    const resultDensity = filesScanned > 0 ? matches.length / filesScanned : 0;
+    session.addRankingFactor({
+      factor: 'Result Density',
+      weight: 0.4,
+      value: resultDensity,
+      impact: resultDensity * 0.4,
+      explanation: `Found ${matches.length} matches in ${filesScanned} files (${(resultDensity * 100).toFixed(2)}% hit rate)`,
+    });
+
+    // File filter factor
+    if (options.include) {
+      session.addRankingFactor({
+        factor: 'File Filter',
+        weight: 0.1,
+        value: 1.0,
+        impact: 0.1,
+        explanation: `Applied file filter: ${options.include}`,
+      });
+    }
+  }
+
+  /**
+   * Calculate pattern complexity (0-1, where 1 is most complex)
+   */
+  private calculatePatternComplexity(pattern: string): number {
+    let complexity = 0;
+
+    // Regex special characters
+    const regexChars = /[.*+?^${}()|[\]\\]/g;
+    const regexMatches = pattern.match(regexChars);
+    if (regexMatches) {
+      complexity += Math.min(regexMatches.length * 0.1, 0.5);
+    }
+
+    // Length factor
+    complexity += Math.min(pattern.length * 0.01, 0.3);
+
+    // Case sensitivity
+    if (
+      pattern !== pattern.toLowerCase() &&
+      pattern !== pattern.toUpperCase()
+    ) {
+      complexity += 0.1;
+    }
+
+    // Word boundaries and special patterns
+    if (
+      pattern.includes('\\b') ||
+      pattern.includes('\\w') ||
+      pattern.includes('\\d')
+    ) {
+      complexity += 0.2;
+    }
+
+    return Math.min(complexity, 1);
   }
 }
